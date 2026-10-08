@@ -1,0 +1,3364 @@
+-- FULL FIXED VERSION:
+-- CFrame Speed = default 100 horizontal speed (adjustable 0-5000)
+-- Hide Item = 17 horizontal speed
+-- Hide Item stays flipped
+-- Entire held Tool gets hidden below the floor
+-- Camera stays above the floor
+-- Strong gravity for fast falling
+-- Auto-floor continuously detects the surface beneath you
+-- Does not use a second RenderStepped movement controller
+-- Prevents CFrame Speed from punching through the floor
+-- Base entrances use floor hysteresis to prevent Y-jitter
+-- Collision is disabled for walls while floor placement is simulated
+-- Premium UI redesigned: large panel, 2-column grid, C toggle button
+-- Panel starts minimized; C button is draggable and clickable
+-- Server Hop shortcut button sits next to the C button (draggable)
+-- ESP + Server Hop are preserved
+-- Auto Grab instantly fires the nearest in-range ProximityPrompt
+-- Auto Grab: handles custom prompts (LOS off, deep nesting, fallback)
+-- Performance: incremental prompt tracking + ESP part caching
+-- Keybinds: configurable toggle keys for Auto Grab and CFrame Speed
+-- Keybinds persist across executions via CFrameControlKeybinds.json
+-- Speed slider: 0-5000 adjustable CFrame speed
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+
+--------------------------------------------------
+-- WAIT UNTIL FULLY LOADED
+--------------------------------------------------
+
+-- 1) Wait for the game itself to finish loading.
+if not game:IsLoaded() then
+	game.Loaded:Wait()
+end
+
+-- 2) Wait for the local player and their PlayerGui.
+player:WaitForChild("PlayerGui")
+
+-- 3) Wait for the character and its core instances.
+if not player.Character then
+	player.CharacterAdded:Wait()
+end
+
+player.Character:WaitForChild("Humanoid")
+player.Character:WaitForChild("HumanoidRootPart")
+
+--------------------------------------------------
+-- SETTINGS
+--------------------------------------------------
+
+local CFRAME_SPEED = 100
+local CFRAME_SPEED_MIN = 0
+local CFRAME_SPEED_MAX = 5000
+
+local HIDE_ITEM_SPEED = 17
+local FORWARD_SPEED = 40
+local FORWARD_DURATION = 0.8
+
+local HIDE_ITEM_SUBMERGE = 0.50
+local HIDE_ITEM_GRAVITY = 1200
+local HIDE_ITEM_MAX_FALL_SPEED = 420
+local HIDE_ITEM_FLOOR_GAP = 0.05
+local HIDE_ITEM_CAMERA_OFFSET = 6.25
+
+local FLOOR_RAY_DISTANCE = 5000
+local FLOOR_REFRESH = 0.06
+local FLOOR_NORMAL_MIN = 0.55
+local FLOOR_REJECT_ABOVE_ROOT = 1.0
+local FLOOR_PROBE_RADIUS = 2.0
+local FLOOR_UPWARD_RECOVERY = 900
+local FLOOR_HARD_RECOVERY_DISTANCE = 12
+
+local LOG_MAX_AGE = 3600
+local MAX_RECENT_HOPS = 20
+local LOG_NAMESPACE = "sh_main"
+
+-- Auto Grab
+local AUTO_GRAB_INTERVAL = 0.10
+local AUTO_GRAB_PROMPT_COOLDOWN = 0.25
+local AUTO_GRAB_SWEEP_INTERVAL = 5.0
+local AUTO_GRAB_MIN_RADIUS = 20
+
+-- Keybind persistence
+local KEYBIND_FILE = "CFrameControlKeybinds.json"
+
+-- Auto re-execute after server hop
+local AUTO_REEXEC = true
+local REEXEC_FILE = "CFrameControl.lua"   -- save this script in your executor's workspace folder with this name
+local REEXEC_URL = ""                      -- or a raw link, e.g. "https://raw.githubusercontent.com/you/repo/main/script.lua"
+
+--------------------------------------------------
+-- COLORS
+--------------------------------------------------
+
+local C_BG = Color3.fromRGB(13, 14, 17)
+local C_PANEL = Color3.fromRGB(18, 19, 23)
+local C_ROW = Color3.fromRGB(22, 23, 28)
+local C_ROW_HOVER = Color3.fromRGB(27, 29, 35)
+local C_ROW_ON = Color3.fromRGB(22, 31, 34)
+local C_BORDER = Color3.fromRGB(45, 47, 54)
+local C_BORDER_HOVER = Color3.fromRGB(68, 71, 80)
+local C_BORDER_ON = Color3.fromRGB(55, 155, 162)
+local C_ACCENT = Color3.fromRGB(69, 211, 219)
+local C_TEXT = Color3.fromRGB(239, 240, 243)
+local C_TEXT_2 = Color3.fromRGB(174, 177, 185)
+local C_MUTED = Color3.fromRGB(105, 109, 119)
+
+local function tween(object, props, duration)
+	return TweenService:Create(
+		object,
+		TweenInfo.new(
+			duration or 0.14,
+			Enum.EasingStyle.Quart,
+			Enum.EasingDirection.Out
+		),
+		props
+	)
+end
+
+--------------------------------------------------
+-- SERVER HOP LOG
+--------------------------------------------------
+
+local LOG_FOLDER = "ServerHopLogs"
+local LOG_BASE = string.format("history_%d_%s", game.PlaceId, LOG_NAMESPACE)
+local LOG_JSON = LOG_FOLDER .. "/" .. LOG_BASE .. ".json"
+local LOG_TEXT = LOG_FOLDER .. "/" .. LOG_BASE .. ".txt"
+
+local hasFileIO =
+	type(writefile) == "function" and
+	type(readfile) == "function" and
+	type(isfile) == "function"
+
+local function ensureFolder()
+	if not hasFileIO then return end
+
+	if type(isfolder) == "function"
+		and not isfolder(LOG_FOLDER)
+	then
+		pcall(makefolder, LOG_FOLDER)
+	end
+end
+
+local function pruneLog(log)
+	local now = os.time()
+
+	for id, stamp in pairs(log) do
+		if type(id) ~= "string"
+			or type(stamp) ~= "number"
+			or now - stamp >= LOG_MAX_AGE
+		then
+			log[id] = nil
+		end
+	end
+end
+
+local function saveLog(log)
+	if not hasFileIO then return end
+
+	ensureFolder()
+
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode(log)
+	end)
+
+	if ok then
+		pcall(writefile, LOG_JSON, encoded)
+	end
+
+	local entries = {}
+
+	for id, stamp in pairs(log) do
+		entries[#entries + 1] = {
+			id = id,
+			ts = stamp
+		}
+	end
+
+	table.sort(
+		entries,
+		function(a, b)
+			return a.ts < b.ts
+		end
+	)
+
+	local lines = {
+		"# Server Hop Log",
+		"# Place: " .. tostring(game.PlaceId),
+		"# Namespace: " .. LOG_NAMESPACE,
+		"# Auto-resets after 1 hour"
+	}
+
+	for _, entry in ipairs(entries) do
+		lines[#lines + 1] =
+			string.format(
+				"[%s] %s",
+				os.date(
+					"%Y-%m-%d %H:%M:%S",
+					entry.ts
+				),
+				entry.id
+			)
+	end
+
+	pcall(
+		writefile,
+		LOG_TEXT,
+		table.concat(lines, "\n")
+	)
+end
+
+local function loadLog()
+	if not hasFileIO then
+		return {}
+	end
+
+	ensureFolder()
+
+	if not isfile(LOG_JSON) then
+		return {}
+	end
+
+	local ok, data =
+		pcall(
+			readfile,
+			LOG_JSON
+		)
+
+	if not ok
+		or not data
+		or data == ""
+	then
+		return {}
+	end
+
+	local decodedOk, decoded =
+		pcall(
+			function()
+				return HttpService:JSONDecode(data)
+			end
+		)
+
+	if decodedOk
+		and type(decoded) == "table"
+	then
+		return decoded
+	end
+
+	return {}
+end
+
+local visitedServers = loadLog()
+
+pruneLog(visitedServers)
+
+if game.JobId
+	and game.JobId ~= ""
+then
+	visitedServers[
+		game.JobId
+	] = os.time()
+end
+
+saveLog(visitedServers)
+
+local recentHops = {}
+
+local function markVisited(id)
+	if not id or id == "" then
+		return
+	end
+
+	visitedServers[id] = os.time()
+
+	pruneLog(
+		visitedServers
+	)
+
+	saveLog(
+		visitedServers
+	)
+end
+
+local function pushRecent(id)
+	if not id or id == "" then
+		return
+	end
+
+	for i = #recentHops, 1, -1 do
+		if recentHops[i] == id then
+			table.remove(
+				recentHops,
+				i
+			)
+		end
+	end
+
+	table.insert(
+		recentHops,
+		1,
+		id
+	)
+
+	while #recentHops > MAX_RECENT_HOPS do
+		table.remove(
+			recentHops
+		)
+	end
+end
+
+local function isRecent(id)
+	for _, v in ipairs(recentHops) do
+		if v == id then
+			return true
+		end
+	end
+
+	return false
+end
+
+--------------------------------------------------
+-- STATE
+--------------------------------------------------
+
+local cframeEnabled = false
+local hideEnabled = false
+local forwardActive = false
+local forwardEnd = 0
+local espEnabled = false
+local hopping = false
+local autoGrabEnabled = false
+
+local savedAutoRotate = nil
+local hideVelocityY = 0
+
+local cachedFloorY = nil
+local floorTimer = 0
+
+local pendingFloorY = nil
+local pendingFloorCount = 0
+
+-- Auto Grab runtime
+local autoGrabTimer = 0
+local autoGrabSweepTimer = 0
+local trackedPrompts = {}
+local trackedPromptSet = {}
+local promptCooldowns =
+	setmetatable({}, { __mode = "k" })
+
+local promptRetries = {}
+
+local promptAddConn = nil
+local promptRemoveConn = nil
+
+-- ESP runtime
+local espPartCache = {}
+
+-- Keybinds
+local keybinds = {
+	autoGrab = nil,
+	cframeSpeed = nil,
+}
+
+local listeningForKey = nil
+
+-- Sliders
+local sliderRegistry = {}
+
+-- Panel state
+local panelOpen = false
+
+--------------------------------------------------
+-- KEYBIND PERSISTENCE
+--------------------------------------------------
+
+local function saveKeybinds()
+	if not hasFileIO then return end
+
+	local data = {}
+
+	for name, code in pairs(keybinds) do
+		if code then
+			data[name] = code.Name
+		end
+	end
+
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode(data)
+	end)
+
+	if ok then
+		pcall(writefile, KEYBIND_FILE, encoded)
+	end
+end
+
+local function loadKeybinds()
+	if not hasFileIO
+		or not isfile(KEYBIND_FILE)
+	then
+		return
+	end
+
+	local ok, data =
+		pcall(
+			readfile,
+			KEYBIND_FILE
+		)
+
+	if not ok
+		or not data
+		or data == ""
+	then
+		return
+	end
+
+	local decodedOk, decoded =
+		pcall(
+			function()
+				return HttpService:JSONDecode(data)
+			end
+		)
+
+	if not decodedOk
+		or type(decoded) ~= "table"
+	then
+		return
+	end
+
+	for name, keyName in pairs(decoded) do
+		if (name == "autoGrab"
+				or name == "cframeSpeed")
+			and type(keyName) == "string"
+		then
+			local success, code =
+				pcall(
+					function()
+						return Enum.KeyCode[keyName]
+					end
+				)
+
+			if success
+				and code
+				and code ~= Enum.KeyCode.Unknown
+			then
+				keybinds[name] = code
+			end
+		end
+	end
+end
+
+loadKeybinds()
+
+--------------------------------------------------
+-- COLLISION
+--------------------------------------------------
+
+local savedCollision = {}
+local savedCharacter = nil
+
+local function getCharacter()
+	return player.Character
+end
+
+local function saveCollision(character)
+	if not character then return end
+
+	if savedCharacter ~= character then
+		table.clear(savedCollision)
+		savedCharacter = character
+	end
+
+	for _, object in ipairs(
+		character:GetDescendants()
+	) do
+		if object:IsA("BasePart")
+			and savedCollision[object] == nil
+		then
+			savedCollision[object] = {
+				CanCollide = object.CanCollide,
+				CanTouch = object.CanTouch,
+				CanQuery = object.CanQuery
+			}
+		end
+	end
+end
+
+local function disableCharacterCollision(character)
+	if not character then
+		return
+	end
+
+	saveCollision(character)
+
+	for _, object in ipairs(
+		character:GetDescendants()
+	) do
+		if object:IsA("BasePart") then
+			object.CanCollide = false
+			object.CanTouch = false
+			object.CanQuery = false
+		end
+	end
+end
+
+local function restoreCharacterCollision(character)
+	if not character then
+		return
+	end
+
+	for object, state in pairs(
+		savedCollision
+	) do
+		if object and object.Parent then
+			object.CanCollide = state.CanCollide
+			object.CanTouch = state.CanTouch
+			object.CanQuery = state.CanQuery
+		end
+	end
+
+	table.clear(savedCollision)
+	savedCharacter = nil
+end
+
+local function refreshCollision()
+	local character = getCharacter()
+
+	if not character then
+		return
+	end
+
+	if cframeEnabled
+		or hideEnabled
+		or forwardActive
+	then
+		disableCharacterCollision(
+			character
+		)
+	else
+		restoreCharacterCollision(
+			character
+		)
+	end
+end
+
+--------------------------------------------------
+-- GEOMETRY
+--------------------------------------------------
+
+local FLIP =
+	CFrame.Angles(
+		0,
+		0,
+		math.pi
+	)
+
+local function flatLook(root)
+	local look =
+		root.CFrame.LookVector
+
+	local flat =
+		Vector3.new(
+			look.X,
+			0,
+			look.Z
+		)
+
+	if flat.Magnitude < 0.01 then
+		flat =
+			Vector3.new(
+				0,
+				0,
+				-1
+			)
+	end
+
+	return flat.Unit
+end
+
+local function partYBounds(part)
+	local half =
+		part.Size * 0.5
+
+	local cf =
+		part.CFrame
+
+	local corners = {
+		Vector3.new(-half.X, -half.Y, -half.Z),
+		Vector3.new(-half.X, -half.Y, half.Z),
+		Vector3.new(-half.X, half.Y, -half.Z),
+		Vector3.new(-half.X, half.Y, half.Z),
+		Vector3.new(half.X, -half.Y, -half.Z),
+		Vector3.new(half.X, -half.Y, half.Z),
+		Vector3.new(half.X, half.Y, -half.Z),
+		Vector3.new(half.X, half.Y, half.Z),
+	}
+
+	local minY = math.huge
+	local maxY = -math.huge
+
+	for _, corner in ipairs(corners) do
+		local point = cf * corner
+		minY = math.min(minY, point.Y)
+		maxY = math.max(maxY, point.Y)
+	end
+
+	return minY, maxY
+end
+
+local function bodyYBounds(character)
+	local minY = math.huge
+	local maxY = -math.huge
+
+	for _, object in ipairs(
+		character:GetDescendants()
+	) do
+		if object:IsA("BasePart")
+			and not object:FindFirstAncestorOfClass("Tool")
+		then
+			local a, b =
+				partYBounds(object)
+
+			minY = math.min(minY, a)
+			maxY = math.max(maxY, b)
+		end
+	end
+
+	if minY == math.huge then
+		return nil, nil, nil
+	end
+
+	return minY, maxY, maxY - minY
+end
+
+local function equippedTool(character)
+	for _, child in ipairs(
+		character:GetChildren()
+	) do
+		if child:IsA("Tool") then
+			return child
+		end
+	end
+
+	return nil
+end
+
+local function toolYBounds(tool)
+	if not tool then
+		return nil, nil
+	end
+
+	local minY = math.huge
+	local maxY = -math.huge
+
+	for _, object in ipairs(
+		tool:GetDescendants()
+	) do
+		if object:IsA("BasePart") then
+			local a, b =
+				partYBounds(object)
+
+			minY = math.min(minY, a)
+			maxY = math.max(maxY, b)
+		end
+	end
+
+	if minY == math.huge then
+		return nil, nil
+	end
+
+	return minY, maxY
+end
+
+--------------------------------------------------
+-- FLOOR DETECTOR
+--------------------------------------------------
+
+local function rayParams(character)
+	local params =
+		RaycastParams.new()
+
+	params.FilterType =
+		Enum.RaycastFilterType.Exclude
+
+	params.FilterDescendantsInstances = {
+		character
+	}
+
+	params.IgnoreWater = false
+
+	return params
+end
+
+local function validFloor(
+	hit,
+	rootY,
+	upward
+)
+	if not hit then
+		return false
+	end
+
+	if upward then
+		return hit.Normal.Y <=
+			-FLOOR_NORMAL_MIN
+	end
+
+	if hit.Normal.Y <
+		FLOOR_NORMAL_MIN
+	then
+		return false
+	end
+
+	if hit.Position.Y >
+		rootY + FLOOR_REJECT_ABOVE_ROOT
+	then
+		return false
+	end
+
+	return true
+end
+
+local function findFloorBelow(
+	character,
+	root
+)
+	local params =
+		rayParams(character)
+
+	local offsets = {
+		Vector3.new(0, 0, 0),
+		Vector3.new(FLOOR_PROBE_RADIUS, 0, 0),
+		Vector3.new(-FLOOR_PROBE_RADIUS, 0, 0),
+		Vector3.new(0, 0, FLOOR_PROBE_RADIUS),
+		Vector3.new(0, 0, -FLOOR_PROBE_RADIUS),
+	}
+
+	local best = nil
+	local bestDistance = math.huge
+	local originY = root.Position.Y + 0.75
+
+	for _, offset in ipairs(offsets) do
+		local origin =
+			Vector3.new(
+				root.Position.X + offset.X,
+				originY,
+				root.Position.Z + offset.Z
+			)
+
+		local hit =
+			workspace:Raycast(
+				origin,
+				Vector3.new(
+					0,
+					-FLOOR_RAY_DISTANCE,
+					0
+				),
+				params
+			)
+
+		if validFloor(hit, root.Position.Y, false) then
+			local distance =
+				math.abs(
+					hit.Position.Y
+					- root.Position.Y
+				)
+
+			if distance < bestDistance then
+				bestDistance = distance
+				best = hit
+			end
+		end
+	end
+
+	return best
+end
+
+local function recoverFloor(
+	character,
+	root
+)
+	if cachedFloorY == nil then
+		return nil
+	end
+
+	if root.Position.Y >=
+		cachedFloorY
+		- FLOOR_HARD_RECOVERY_DISTANCE
+	then
+		return nil
+	end
+
+	local params =
+		rayParams(character)
+
+	local hit =
+		workspace:Raycast(
+			root.Position
+				- Vector3.new(0, 2, 0),
+			Vector3.new(
+				0,
+				FLOOR_UPWARD_RECOVERY,
+				0
+			),
+			params
+		)
+
+	if validFloor(hit, root.Position.Y, true) then
+		return hit
+	end
+
+	return nil
+end
+
+local function updateFloor(
+	character,
+	root,
+	dt
+)
+	floorTimer = floorTimer - dt
+
+	if floorTimer > 0
+		and cachedFloorY ~= nil
+	then
+		return
+	end
+
+	floorTimer = FLOOR_REFRESH
+
+	local hit =
+		findFloorBelow(character, root)
+
+	if not hit then
+		hit = recoverFloor(character, root)
+	end
+
+	if not hit then
+		return
+	end
+
+	local newFloorY = hit.Position.Y
+
+	if cachedFloorY == nil then
+		cachedFloorY = newFloorY
+		pendingFloorY = nil
+		pendingFloorCount = 0
+		return
+	end
+
+	if math.abs(
+		newFloorY - cachedFloorY
+	) <= 2.5 then
+
+		cachedFloorY = newFloorY
+		pendingFloorY = nil
+		pendingFloorCount = 0
+		return
+	end
+
+	if pendingFloorY
+		and math.abs(
+			pendingFloorY - newFloorY
+		) <= 0.6
+	then
+		pendingFloorCount =
+			pendingFloorCount + 1
+	else
+		pendingFloorY = newFloorY
+		pendingFloorCount = 1
+	end
+
+	if pendingFloorCount >= 2 then
+		cachedFloorY = pendingFloorY
+		pendingFloorY = nil
+		pendingFloorCount = 0
+	end
+end
+
+--------------------------------------------------
+-- HIDE ITEM CAMERA
+--------------------------------------------------
+
+local function updateHideCamera(humanoid)
+	if hideEnabled then
+		humanoid.CameraOffset =
+			Vector3.new(
+				0,
+				-HIDE_ITEM_CAMERA_OFFSET,
+				0
+			)
+	else
+		humanoid.CameraOffset =
+			Vector3.zero
+	end
+end
+
+--------------------------------------------------
+-- HIDE ITEM TARGET
+--------------------------------------------------
+
+local function getHideTarget(character, floorY)
+	local bodyMin,
+		bodyMax,
+		bodyHeight =
+		bodyYBounds(character)
+
+	if not bodyMin
+		or not bodyMax
+		or not bodyHeight
+	then
+		return nil, nil
+	end
+
+	local targetMin =
+		floorY
+		- (bodyHeight * HIDE_ITEM_SUBMERGE)
+		+ HIDE_ITEM_FLOOR_GAP
+
+	local tool = equippedTool(character)
+
+	if tool then
+		local _, toolMax =
+			toolYBounds(tool)
+
+		if toolMax then
+			local itemTargetMax =
+				floorY - HIDE_ITEM_FLOOR_GAP
+
+			local requiredMin =
+				bodyMin
+				+ (itemTargetMax - toolMax)
+
+			if requiredMin < targetMin then
+				targetMin = requiredMin
+			end
+		end
+	end
+
+	return targetMin, bodyMin
+end
+
+--------------------------------------------------
+-- HIDE ITEM PLACEMENT
+--------------------------------------------------
+
+local function applyHidePlacement(
+	character,
+	root,
+	humanoid,
+	dt
+)
+	if not hideEnabled then
+		return
+	end
+
+	local bodyMin, bodyMax =
+		bodyYBounds(character)
+
+	if not bodyMin or not bodyMax then
+		return
+	end
+
+	updateFloor(character, root, dt)
+
+	if cachedFloorY == nil then
+		return
+	end
+
+	hideVelocityY =
+		math.max(
+			hideVelocityY
+				- (HIDE_ITEM_GRAVITY * dt),
+			-HIDE_ITEM_MAX_FALL_SPEED
+		)
+
+	local targetMin, currentMin =
+		getHideTarget(
+			character,
+			cachedFloorY
+		)
+
+	if not targetMin then
+		return
+	end
+
+	local correction = targetMin - currentMin
+	local moveY = 0
+
+	if correction < 0 then
+		moveY =
+			math.max(
+				correction,
+				hideVelocityY * dt
+			)
+	else
+		moveY = math.min(correction, 30)
+	end
+
+	if math.abs(moveY) > 0.001 then
+		root.CFrame =
+			root.CFrame
+			+ Vector3.new(0, moveY, 0)
+	end
+
+	if math.abs(correction)
+		<= math.abs(moveY) + 0.001
+	then
+		hideVelocityY = 0
+	end
+
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+
+	updateHideCamera(humanoid)
+end
+
+--------------------------------------------------
+-- HIDE ITEM ROTATION
+--------------------------------------------------
+
+local function applyHideRotation(root)
+	if not hideEnabled then
+		return
+	end
+
+	local position = root.Position
+	local direction = flatLook(root)
+
+	root.CFrame =
+		CFrame.lookAt(
+			position,
+			position + direction
+		) * FLIP
+end
+
+--------------------------------------------------
+-- AUTO GRAB
+--------------------------------------------------
+
+local function trackPrompt(prompt)
+	if trackedPromptSet[prompt] then
+		return
+	end
+
+	trackedPromptSet[prompt] = true
+	trackedPrompts[#trackedPrompts + 1] = prompt
+end
+
+local function untrackPrompt(prompt)
+	trackedPromptSet[prompt] = nil
+end
+
+local function doFullPromptScan()
+	table.clear(trackedPrompts)
+	table.clear(trackedPromptSet)
+
+	local descendants = workspace:GetDescendants()
+
+	for i = 1, #descendants do
+		local obj = descendants[i]
+
+		if obj:IsA("ProximityPrompt") then
+			trackedPromptSet[obj] = true
+			trackedPrompts[#trackedPrompts + 1] = obj
+		end
+	end
+end
+
+local function compactPrompts()
+	local write = 1
+	local count = #trackedPrompts
+
+	for read = 1, count do
+		local p = trackedPrompts[read]
+
+		if p
+			and trackedPromptSet[p]
+			and p.Parent
+		then
+			trackedPrompts[write] = p
+			write = write + 1
+		elseif p then
+			trackedPromptSet[p] = nil
+		end
+	end
+
+	for i = count, write, -1 do
+		trackedPrompts[i] = nil
+	end
+end
+
+local function startAutoGrab()
+	doFullPromptScan()
+
+	promptAddConn =
+		workspace.DescendantAdded:Connect(
+			function(obj)
+				if obj:IsA("ProximityPrompt") then
+					trackPrompt(obj)
+				end
+			end
+		)
+
+	promptRemoveConn =
+		workspace.DescendantRemoving:Connect(
+			function(obj)
+				if obj:IsA("ProximityPrompt") then
+					untrackPrompt(obj)
+				end
+			end
+		)
+
+	autoGrabTimer = 0
+	autoGrabSweepTimer = AUTO_GRAB_SWEEP_INTERVAL
+	table.clear(promptRetries)
+end
+
+local function stopAutoGrab()
+	if promptAddConn then
+		promptAddConn:Disconnect()
+		promptAddConn = nil
+	end
+
+	if promptRemoveConn then
+		promptRemoveConn:Disconnect()
+		promptRemoveConn = nil
+	end
+
+	table.clear(trackedPrompts)
+	table.clear(trackedPromptSet)
+	table.clear(promptCooldowns)
+	table.clear(promptRetries)
+end
+
+local function promptWorldPosition(prompt)
+	local current = prompt.Parent
+	local depth = 0
+
+	while current and depth < 12 do
+		if current:IsA("BasePart") then
+			return current.Position
+		elseif current:IsA("Attachment") then
+			return current.WorldPosition
+		end
+
+		current = current.Parent
+		depth = depth + 1
+	end
+
+	return nil
+end
+
+local function findNearestPrompt(root)
+	local rootPos = root.Position
+	local rootX = rootPos.X
+	local rootY = rootPos.Y
+	local rootZ = rootPos.Z
+
+	local now = os.clock()
+
+	local nearest = nil
+	local nearestSqr = math.huge
+
+	local list = trackedPrompts
+	local count = #list
+
+	for i = 1, count do
+		local prompt = list[i]
+
+		if prompt and prompt.Enabled then
+			local last = promptCooldowns[prompt]
+
+			if not last
+				or now - last
+					>= AUTO_GRAB_PROMPT_COOLDOWN
+			then
+				local pos =
+					promptWorldPosition(prompt)
+
+				if pos then
+					local dx = pos.X - rootX
+					local dy = pos.Y - rootY
+					local dz = pos.Z - rootZ
+
+					local sqr =
+						dx * dx
+						+ dy * dy
+						+ dz * dz
+
+					local maxDist =
+						math.max(
+							prompt
+								.MaxActivationDistance,
+							AUTO_GRAB_MIN_RADIUS
+						)
+
+					if sqr
+						<= maxDist * maxDist
+						and sqr < nearestSqr
+					then
+						nearest = prompt
+						nearestSqr = sqr
+					end
+				end
+			end
+		end
+	end
+
+	return nearest
+end
+
+local function tryFirePrompt(prompt, forceEnabled)
+	if not prompt or not prompt.Parent then
+		return false
+	end
+
+	local originalHold = prompt.HoldDuration
+	local originalLos = prompt.RequiresLineOfSight
+	local originalEnabled = prompt.Enabled
+
+	if originalHold > 0 then
+		prompt.HoldDuration = 0
+	end
+
+	if originalLos then
+		prompt.RequiresLineOfSight = false
+	end
+
+	if forceEnabled and not originalEnabled then
+		prompt.Enabled = true
+	end
+
+	local ok = pcall(function()
+		prompt:InputHoldBegin()
+		prompt:InputHoldEnd()
+	end)
+
+	if originalHold > 0 then
+		prompt.HoldDuration = originalHold
+	end
+
+	if originalLos then
+		prompt.RequiresLineOfSight = originalLos
+	end
+
+	if forceEnabled and not originalEnabled then
+		prompt.Enabled = originalEnabled
+	end
+
+	return ok
+end
+
+local function firePrompt(prompt)
+	if not prompt or not prompt.Parent then
+		return
+	end
+
+	local now = os.clock()
+
+	tryFirePrompt(prompt, false)
+
+	promptCooldowns[prompt] = now
+
+	promptRetries[#promptRetries + 1] = {
+		prompt = prompt,
+		at = now + 0.05,
+	}
+end
+
+local function processRetries()
+	if #promptRetries == 0 then
+		return
+	end
+
+	local now = os.clock()
+	local write = 1
+	local count = #promptRetries
+
+	for read = 1, count do
+		local entry = promptRetries[read]
+
+		if entry.at <= now then
+			local p = entry.prompt
+
+			if p and p.Parent then
+				tryFirePrompt(p, true)
+				promptCooldowns[p] = now
+			end
+		else
+			promptRetries[write] = entry
+			write = write + 1
+		end
+	end
+
+	for i = count, write, -1 do
+		promptRetries[i] = nil
+	end
+end
+
+local function updateAutoGrab(root, dt)
+	if not autoGrabEnabled then
+		return
+	end
+
+	processRetries()
+
+	autoGrabSweepTimer =
+		autoGrabSweepTimer - dt
+
+	if autoGrabSweepTimer <= 0 then
+		autoGrabSweepTimer =
+			AUTO_GRAB_SWEEP_INTERVAL
+
+		compactPrompts()
+	end
+
+	autoGrabTimer =
+		autoGrabTimer - dt
+
+	if autoGrabTimer > 0 then
+		return
+	end
+
+	autoGrabTimer = AUTO_GRAB_INTERVAL
+
+	local nearest =
+		findNearestPrompt(root)
+
+	if nearest then
+		firePrompt(nearest)
+	end
+end
+
+--------------------------------------------------
+-- RESPAWN
+--------------------------------------------------
+
+player.CharacterAdded:Connect(
+	function(character)
+		table.clear(savedCollision)
+		savedCharacter = nil
+
+		hideVelocityY = 0
+
+		cachedFloorY = nil
+		floorTimer = 0
+
+		pendingFloorY = nil
+		pendingFloorCount = 0
+
+		task.wait(0.25)
+
+		local humanoid =
+			character:FindFirstChildOfClass(
+				"Humanoid"
+			)
+
+		if humanoid then
+			humanoid.AutoRotate =
+				hideEnabled
+				and false
+				or true
+
+			updateHideCamera(humanoid)
+		end
+
+		refreshCollision()
+	end
+)
+
+--------------------------------------------------
+-- GUI
+--------------------------------------------------
+
+local playerGui =
+	player:WaitForChild("PlayerGui")
+
+local oldGui =
+	playerGui:FindFirstChild(
+		"CFrameControl"
+	)
+
+if oldGui then
+	oldGui:Destroy()
+end
+
+local gui =
+	Instance.new("ScreenGui")
+
+gui.Name = "CFrameControl"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior =
+	Enum.ZIndexBehavior.Sibling
+
+gui.DisplayOrder = 100
+gui.Parent = playerGui
+
+local WINDOW_W = 560
+local WINDOW_H = 860
+
+-- Two column grid
+local PAD = 24
+local CONTENT_W = WINDOW_W - PAD * 2          -- 512
+local GAP = 16
+local COL_W = math.floor((CONTENT_W - GAP) / 2)  -- 248
+local COL1_X = PAD
+local COL2_X = PAD + COL_W + GAP
+
+--------------------------------------------------
+-- MAIN PANEL
+--------------------------------------------------
+
+local main =
+	Instance.new("Frame")
+
+main.Name = "Main"
+
+main.Size =
+	UDim2.new(
+		0,
+		WINDOW_W,
+		0,
+		WINDOW_H
+	)
+
+main.Position =
+	UDim2.new(
+		0.5,
+		-WINDOW_W / 2,
+		0.5,
+		-WINDOW_H / 2
+	)
+
+main.BackgroundColor3 = C_PANEL
+main.BorderSizePixel = 0
+main.Active = true
+main.ClipsDescendants = true
+main.Visible = false       -- starts minimized
+main.Parent = gui
+
+local mainCorner =
+	Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 20)
+mainCorner.Parent = main
+
+local mainStroke =
+	Instance.new("UIStroke")
+mainStroke.Thickness = 1
+mainStroke.Color = C_BORDER
+mainStroke.Transparency = 0.05
+mainStroke.Parent = main
+
+local panelScale =
+	Instance.new("UIScale")
+panelScale.Scale = 1
+panelScale.Parent = main
+
+--------------------------------------------------
+-- HEADER
+--------------------------------------------------
+
+local header =
+	Instance.new("Frame")
+
+header.Name = "Header"
+header.Size = UDim2.new(1, 0, 0, 115)
+header.BackgroundColor3 = C_BG
+header.BorderSizePixel = 0
+header.Parent = main
+
+local headerCorner =
+	Instance.new("UICorner")
+headerCorner.CornerRadius = UDim.new(0, 20)
+headerCorner.Parent = header
+
+local headerMask =
+	Instance.new("Frame")
+headerMask.Size = UDim2.new(1, 0, 0, 22)
+headerMask.Position = UDim2.new(0, 0, 1, -22)
+headerMask.BackgroundColor3 = C_BG
+headerMask.BorderSizePixel = 0
+headerMask.Parent = header
+
+local accent =
+	Instance.new("Frame")
+accent.Size = UDim2.new(0, 64, 0, 4)
+accent.Position = UDim2.new(0, 28, 0, 0)
+accent.BackgroundColor3 = C_ACCENT
+accent.BorderSizePixel = 0
+accent.Parent = main
+
+local accentCorner =
+	Instance.new("UICorner")
+accentCorner.CornerRadius = UDim.new(1, 0)
+accentCorner.Parent = accent
+
+local brand =
+	Instance.new("TextLabel")
+brand.Size = UDim2.new(0, 260, 0, 14)
+brand.Position = UDim2.new(0, 28, 0, 22)
+brand.BackgroundTransparency = 1
+brand.Text = "CAYDEN'S"
+brand.TextColor3 = C_MUTED
+brand.TextSize = 10
+brand.Font = Enum.Font.GothamBold
+brand.TextXAlignment = Enum.TextXAlignment.Left
+brand.Parent = main
+
+local title =
+	Instance.new("TextLabel")
+title.Size = UDim2.new(0, 400, 0, 32)
+title.Position = UDim2.new(0, 28, 0, 42)
+title.BackgroundTransparency = 1
+title.Text = "Steal a Peru"
+title.TextColor3 = C_TEXT
+title.TextSize = 24
+title.Font = Enum.Font.GothamBold
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = main
+
+local version =
+	Instance.new("TextLabel")
+version.Size = UDim2.new(0, 120, 0, 16)
+version.Position = UDim2.new(1, -144, 0, 22)
+version.BackgroundTransparency = 1
+version.Text = "CONTROL"
+version.TextColor3 = C_MUTED
+version.TextSize = 10
+version.Font = Enum.Font.GothamBold
+version.TextXAlignment = Enum.TextXAlignment.Right
+version.Parent = main
+
+local dragHandle =
+	Instance.new("Frame")
+dragHandle.Size = UDim2.new(1, 0, 0, 115)
+dragHandle.BackgroundTransparency = 1
+dragHandle.Parent = main
+
+--------------------------------------------------
+-- STATUS BAR
+--------------------------------------------------
+
+local statusBox =
+	Instance.new("Frame")
+statusBox.Size = UDim2.new(1, -PAD * 2, 0, 50)
+statusBox.Position = UDim2.new(0, PAD, 0, 132)
+statusBox.BackgroundColor3 = C_ROW
+statusBox.BorderSizePixel = 0
+statusBox.Parent = main
+
+local statusCorner =
+	Instance.new("UICorner")
+statusCorner.CornerRadius = UDim.new(0, 12)
+statusCorner.Parent = statusBox
+
+local statusStroke =
+	Instance.new("UIStroke")
+statusStroke.Thickness = 1
+statusStroke.Color = C_BORDER
+statusStroke.Transparency = 0.2
+statusStroke.Parent = statusBox
+
+local statusDot =
+	Instance.new("Frame")
+statusDot.Size = UDim2.new(0, 8, 0, 8)
+statusDot.Position = UDim2.new(0, 18, 0.5, -4)
+statusDot.BackgroundColor3 = C_MUTED
+statusDot.BorderSizePixel = 0
+statusDot.Parent = statusBox
+
+local statusDotCorner =
+	Instance.new("UICorner")
+statusDotCorner.CornerRadius = UDim.new(1, 0)
+statusDotCorner.Parent = statusDot
+
+local status =
+	Instance.new("TextLabel")
+status.Size = UDim2.new(1, -48, 1, 0)
+status.Position = UDim2.new(0, 38, 0, 0)
+status.BackgroundTransparency = 1
+status.Text = "CFrame: OFF"
+status.TextColor3 = C_TEXT_2
+status.TextSize = 12
+status.Font = Enum.Font.GothamMedium
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextYAlignment = Enum.TextYAlignment.Center
+status.TextTruncate = Enum.TextTruncate.AtEnd
+status.Parent = statusBox
+
+local function setStatus(textValue, active)
+	status.Text = textValue
+
+	statusDot.BackgroundColor3 =
+		active and C_ACCENT or C_MUTED
+
+	statusStroke.Color =
+		active and C_BORDER_ON or C_BORDER
+end
+
+--------------------------------------------------
+-- SECTION HEADER
+--------------------------------------------------
+
+local function makeSection(textValue, y)
+	local label =
+		Instance.new("TextLabel")
+
+	label.Size = UDim2.new(0, 200, 0, 14)
+	label.Position = UDim2.new(0, PAD, 0, y)
+	label.BackgroundTransparency = 1
+	label.Text = textValue
+	label.TextColor3 = C_MUTED
+	label.TextSize = 10
+	label.Font = Enum.Font.GothamBold
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Parent = main
+
+	local line =
+		Instance.new("Frame")
+
+	line.Size = UDim2.new(1, -(PAD * 2 + 220), 0, 1)
+	line.Position = UDim2.new(0, PAD + 220, 0, y + 7)
+	line.BackgroundColor3 = C_BORDER
+	line.BorderSizePixel = 0
+	line.Parent = main
+end
+
+--------------------------------------------------
+-- BUTTON BUILDER
+--------------------------------------------------
+
+local buttonRegistry = {}
+
+local function makeButton(
+	name,
+	textValue,
+	chipValue,
+	x,
+	y,
+	width,
+	height
+)
+	width = width or COL_W
+	height = height or 68
+
+	local button =
+		Instance.new("TextButton")
+
+	button.Name = name
+	button.Size = UDim2.new(0, width, 0, height)
+	button.Position = UDim2.new(0, x, 0, y)
+	button.BackgroundColor3 = C_ROW
+	button.BorderSizePixel = 0
+	button.Text = ""
+	button.AutoButtonColor = false
+	button.Active = true
+	button.Parent = main
+
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 12)
+	c.Parent = button
+
+	local s = Instance.new("UIStroke")
+	s.Thickness = 1
+	s.Color = C_BORDER
+	s.Transparency = 0.18
+	s.Parent = button
+
+	local label =
+		Instance.new("TextLabel")
+
+	label.Size = UDim2.new(1, -110, 1, 0)
+	label.Position = UDim2.new(0, 16, 0, 0)
+	label.BackgroundTransparency = 1
+	label.Text = textValue
+	label.TextColor3 = C_TEXT
+	label.TextSize = 13
+	label.Font = Enum.Font.GothamMedium
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextYAlignment = Enum.TextYAlignment.Center
+	label.Parent = button
+
+	local chip =
+		Instance.new("TextLabel")
+
+	chip.Size = UDim2.new(0, 72, 0, 26)
+	chip.Position = UDim2.new(1, -84, 0.5, -13)
+	chip.BackgroundColor3 = C_BG
+	chip.BorderSizePixel = 0
+	chip.Text = chipValue or ""
+	chip.TextColor3 = C_MUTED
+	chip.TextSize = 9
+	chip.Font = Enum.Font.GothamBold
+	chip.TextXAlignment = Enum.TextXAlignment.Center
+	chip.TextYAlignment = Enum.TextYAlignment.Center
+	chip.Parent = button
+
+	local cc = Instance.new("UICorner")
+	cc.CornerRadius = UDim.new(0, 8)
+	cc.Parent = chip
+
+	local cs = Instance.new("UIStroke")
+	cs.Thickness = 1
+	cs.Color = C_BORDER
+	cs.Transparency = 0.15
+	cs.Parent = chip
+
+	buttonRegistry[button] = {
+		stroke = s,
+		label = label,
+		chip = chip,
+		chipStroke = cs,
+		active = false,
+	}
+
+	button.MouseEnter:Connect(function()
+		local info = buttonRegistry[button]
+		if info.active then return end
+
+		tween(button, {
+			BackgroundColor3 = C_ROW_HOVER
+		}, 0.12):Play()
+
+		tween(s, {
+			Color = C_BORDER_HOVER,
+			Transparency = 0
+		}, 0.12):Play()
+	end)
+
+	button.MouseLeave:Connect(function()
+		local info = buttonRegistry[button]
+		if info.active then return end
+
+		tween(button, {
+			BackgroundColor3 = C_ROW
+		}, 0.12):Play()
+
+		tween(s, {
+			Color = C_BORDER,
+			Transparency = 0.18
+		}, 0.12):Play()
+	end)
+
+	return button
+end
+
+local function setButton(
+	button,
+	active,
+	chipText,
+	chipColor
+)
+	local info = buttonRegistry[button]
+
+	if not info then return end
+
+	info.active = active
+
+	if active then
+		tween(button, {
+			BackgroundColor3 = C_ROW_ON
+		}, 0.14):Play()
+
+		tween(info.stroke, {
+			Color = C_BORDER_ON,
+			Transparency = 0
+		}, 0.14):Play()
+
+		tween(info.label, {
+			TextColor3 = C_ACCENT
+		}, 0.14):Play()
+
+		tween(info.chip, {
+			TextColor3 = chipColor or C_ACCENT
+		}, 0.14):Play()
+
+		tween(info.chipStroke, {
+			Color = C_BORDER_ON,
+			Transparency = 0
+		}, 0.14):Play()
+	else
+		tween(button, {
+			BackgroundColor3 = C_ROW
+		}, 0.14):Play()
+
+		tween(info.stroke, {
+			Color = C_BORDER,
+			Transparency = 0.18
+		}, 0.14):Play()
+
+		tween(info.label, {
+			TextColor3 = C_TEXT
+		}, 0.14):Play()
+
+		tween(info.chip, {
+			TextColor3 = chipColor or C_MUTED
+		}, 0.14):Play()
+
+		tween(info.chipStroke, {
+			Color = C_BORDER,
+			Transparency = 0.15
+		}, 0.14):Play()
+	end
+
+	info.chip.Text = chipText or ""
+end
+
+--------------------------------------------------
+-- KEYBIND ROW BUILDER
+--------------------------------------------------
+
+local function makeKeybindRow(labelText, y)
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, -PAD * 2, 0, 46)
+	row.Position = UDim2.new(0, PAD, 0, y)
+	row.BackgroundColor3 = C_ROW
+	row.BorderSizePixel = 0
+	row.Parent = main
+
+	local rowCorner = Instance.new("UICorner")
+	rowCorner.CornerRadius = UDim.new(0, 12)
+	rowCorner.Parent = row
+
+	local rowStroke = Instance.new("UIStroke")
+	rowStroke.Thickness = 1
+	rowStroke.Color = C_BORDER
+	rowStroke.Transparency = 0.18
+	rowStroke.Parent = row
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(0, 200, 1, 0)
+	label.Position = UDim2.new(0, 18, 0, 0)
+	label.BackgroundTransparency = 1
+	label.Text = labelText
+	label.TextColor3 = C_TEXT
+	label.TextSize = 12
+	label.Font = Enum.Font.GothamMedium
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextYAlignment = Enum.TextYAlignment.Center
+	label.Parent = row
+
+	local keyBtn = Instance.new("TextButton")
+	keyBtn.Size = UDim2.new(0, 190, 0, 30)
+	keyBtn.Position = UDim2.new(1, -280, 0.5, -15)
+	keyBtn.BackgroundColor3 = C_BG
+	keyBtn.BorderSizePixel = 0
+	keyBtn.Text = "None"
+	keyBtn.TextColor3 = C_MUTED
+	keyBtn.TextSize = 11
+	keyBtn.Font = Enum.Font.GothamBold
+	keyBtn.AutoButtonColor = false
+	keyBtn.Active = true
+	keyBtn.Parent = row
+
+	local keyCorner = Instance.new("UICorner")
+	keyCorner.CornerRadius = UDim.new(0, 8)
+	keyCorner.Parent = keyBtn
+
+	local keyStroke = Instance.new("UIStroke")
+	keyStroke.Thickness = 1
+	keyStroke.Color = C_BORDER
+	keyStroke.Transparency = 0.15
+	keyStroke.Parent = keyBtn
+
+	local xBtn = Instance.new("TextButton")
+	xBtn.Size = UDim2.new(0, 30, 0, 30)
+	xBtn.Position = UDim2.new(1, -64, 0.5, -15)
+	xBtn.BackgroundColor3 = C_BG
+	xBtn.BorderSizePixel = 0
+	xBtn.Text = "×"
+	xBtn.TextColor3 = C_MUTED
+	xBtn.TextSize = 16
+	xBtn.Font = Enum.Font.GothamBold
+	xBtn.AutoButtonColor = false
+	xBtn.Active = true
+	xBtn.Parent = row
+
+	local xCorner = Instance.new("UICorner")
+	xCorner.CornerRadius = UDim.new(0, 8)
+	xCorner.Parent = xBtn
+
+	local xStroke = Instance.new("UIStroke")
+	xStroke.Thickness = 1
+	xStroke.Color = C_BORDER
+	xStroke.Transparency = 0.15
+	xStroke.Parent = xBtn
+
+	keyBtn.MouseEnter:Connect(function()
+		if listeningForKey then return end
+		tween(keyBtn, {BackgroundColor3 = C_ROW_HOVER}, 0.12):Play()
+		tween(keyStroke, {Color = C_BORDER_HOVER, Transparency = 0}, 0.12):Play()
+	end)
+
+	keyBtn.MouseLeave:Connect(function()
+		if listeningForKey then return end
+		tween(keyBtn, {BackgroundColor3 = C_BG}, 0.12):Play()
+		tween(keyStroke, {Color = C_BORDER, Transparency = 0.15}, 0.12):Play()
+	end)
+
+	xBtn.MouseEnter:Connect(function()
+		tween(xBtn, {BackgroundColor3 = C_ROW_HOVER}, 0.12):Play()
+		tween(xStroke, {Color = C_BORDER_HOVER, Transparency = 0}, 0.12):Play()
+	end)
+
+	xBtn.MouseLeave:Connect(function()
+		tween(xBtn, {BackgroundColor3 = C_BG}, 0.12):Play()
+		tween(xStroke, {Color = C_BORDER, Transparency = 0.15}, 0.12):Play()
+	end)
+
+	return {
+		row = row,
+		keyBtn = keyBtn,
+		keyStroke = keyStroke,
+		xBtn = xBtn,
+	}
+end
+
+--------------------------------------------------
+-- SLIDER BUILDER
+--------------------------------------------------
+
+local function makeSlider(
+	name,
+	labelText,
+	y,
+	minVal,
+	maxVal,
+	initial,
+	onChange
+)
+	local container = Instance.new("Frame")
+	container.Name = name
+	container.Size = UDim2.new(1, -PAD * 2, 0, 68)
+	container.Position = UDim2.new(0, PAD, 0, y)
+	container.BackgroundColor3 = C_ROW
+	container.BorderSizePixel = 0
+	container.Parent = main
+
+	local cc = Instance.new("UICorner")
+	cc.CornerRadius = UDim.new(0, 12)
+	cc.Parent = container
+
+	local cs = Instance.new("UIStroke")
+	cs.Thickness = 1
+	cs.Color = C_BORDER
+	cs.Transparency = 0.18
+	cs.Parent = container
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(0, 220, 0, 16)
+	label.Position = UDim2.new(0, 18, 0, 10)
+	label.BackgroundTransparency = 1
+	label.Text = labelText
+	label.TextColor3 = C_TEXT
+	label.TextSize = 12
+	label.Font = Enum.Font.GothamMedium
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Parent = container
+
+	local valueLabel = Instance.new("TextLabel")
+	valueLabel.Size = UDim2.new(0, 120, 0, 16)
+	valueLabel.Position = UDim2.new(1, -138, 0, 10)
+	valueLabel.BackgroundTransparency = 1
+	valueLabel.Text = tostring(initial)
+	valueLabel.TextColor3 = C_ACCENT
+	valueLabel.TextSize = 12
+	valueLabel.Font = Enum.Font.GothamBold
+	valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+	valueLabel.Parent = container
+
+	local track = Instance.new("Frame")
+	track.Size = UDim2.new(1, -36, 0, 8)
+	track.Position = UDim2.new(0, 18, 0, 44)
+	track.BackgroundColor3 = C_BG
+	track.BorderSizePixel = 0
+	track.Parent = container
+
+	local trackCorner = Instance.new("UICorner")
+	trackCorner.CornerRadius = UDim.new(1, 0)
+	trackCorner.Parent = track
+
+	local initialRatio =
+		(initial - minVal) / (maxVal - minVal)
+
+	local fill = Instance.new("Frame")
+	fill.Size = UDim2.new(initialRatio, 0, 1, 0)
+	fill.BackgroundColor3 = C_ACCENT
+	fill.BorderSizePixel = 0
+	fill.Parent = track
+
+	local fillCorner = Instance.new("UICorner")
+	fillCorner.CornerRadius = UDim.new(1, 0)
+	fillCorner.Parent = fill
+
+	local knob = Instance.new("Frame")
+	knob.Size = UDim2.new(0, 18, 0, 18)
+	knob.AnchorPoint = Vector2.new(0.5, 0.5)
+	knob.Position = UDim2.new(initialRatio, 0, 0.5, 0)
+	knob.BackgroundColor3 = C_TEXT
+	knob.BorderSizePixel = 0
+	knob.Parent = track
+
+	local knobCorner = Instance.new("UICorner")
+	knobCorner.CornerRadius = UDim.new(1, 0)
+	knobCorner.Parent = knob
+
+	local knobStroke = Instance.new("UIStroke")
+	knobStroke.Thickness = 2
+	knobStroke.Color = C_ACCENT
+	knobStroke.Transparency = 0
+	knobStroke.Parent = knob
+
+	local currentValue = initial
+	local draggingSlider = false
+
+	local function updateFromX(x)
+		local absPos = track.AbsolutePosition.X
+		local absSize = track.AbsoluteSize.X
+
+		if absSize <= 0 then
+			return
+		end
+
+		local relative =
+			math.clamp(
+				(x - absPos) / absSize,
+				0,
+				1
+			)
+
+		local newValue =
+			math.floor(
+				minVal
+				+ relative * (maxVal - minVal)
+				+ 0.5
+			)
+
+		if newValue ~= currentValue then
+			currentValue = newValue
+
+			fill.Size = UDim2.new(relative, 0, 1, 0)
+			knob.Position = UDim2.new(relative, 0, 0.5, 0)
+
+			valueLabel.Text = tostring(newValue)
+
+			if onChange then
+				onChange(newValue)
+			end
+		end
+	end
+
+	track.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch
+		then
+			draggingSlider = true
+			updateFromX(input.Position.X)
+		end
+	end)
+
+	knob.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch
+		then
+			draggingSlider = true
+		end
+	end)
+
+	sliderRegistry[#sliderRegistry + 1] = {
+		update = updateFromX,
+		isDragging = function()
+			return draggingSlider
+		end,
+		stop = function()
+			draggingSlider = false
+		end,
+	}
+
+	return {
+		container = container,
+		valueLabel = valueLabel,
+	}
+end
+
+--------------------------------------------------
+-- LAYOUT
+--------------------------------------------------
+
+-- TOGGLES
+makeSection("TOGGLES", 212)
+
+local hideButton =
+	makeButton(
+		"HideItem",
+		"Hide Item",
+		"OFF",
+		COL1_X,
+		236
+	)
+
+local autoGrabButton =
+	makeButton(
+		"AutoGrab",
+		"Auto Grab",
+		"OFF",
+		COL2_X,
+		236
+	)
+
+-- MOVEMENT
+makeSection("MOVEMENT", 336)
+
+local cframeButton =
+	makeButton(
+		"CFrameSpeed",
+		"CFrame Speed",
+		"OFF",
+		COL1_X,
+		360
+	)
+
+local forwardButton =
+	makeButton(
+		"CFrameForward",
+		"CFrame Forward",
+		"READY",
+		COL2_X,
+		360
+	)
+
+-- UTILITIES
+makeSection("UTILITIES", 460)
+
+local espButton =
+	makeButton(
+		"ESP",
+		"ESP",
+		"OFF",
+		COL1_X,
+		484
+	)
+
+local hopButton =
+	makeButton(
+		"ServerHop",
+		"Server Hop",
+		"⇄",
+		COL2_X,
+		484
+	)
+
+-- KEYBINDS
+makeSection("KEYBINDS", 588)
+
+local keybindRows = {}
+
+keybindRows.autoGrab =
+	makeKeybindRow(
+		"Auto Grab",
+		612
+	)
+
+keybindRows.cframeSpeed =
+	makeKeybindRow(
+		"CFrame Speed",
+		666
+	)
+
+-- TUNING
+makeSection("TUNING", 740)
+
+local speedSlider =
+	makeSlider(
+		"CFrameSpeedSlider",
+		"CFrame Speed",
+		764,
+		CFRAME_SPEED_MIN,
+		CFRAME_SPEED_MAX,
+		CFRAME_SPEED,
+		function(v)
+			CFRAME_SPEED = v
+
+			if cframeEnabled then
+				setStatus(
+					"CFrame Speed  •  "
+					.. tostring(v),
+					true
+				)
+			end
+		end
+	)
+
+local footer =
+	Instance.new("TextLabel")
+
+footer.Size = UDim2.new(1, -PAD * 2, 0, 14)
+footer.Position = UDim2.new(0, PAD, 1, -26)
+footer.BackgroundTransparency = 1
+footer.Text = "MOVEMENT CONTROL"
+footer.TextColor3 = C_MUTED
+footer.TextSize = 9
+footer.Font = Enum.Font.GothamBold
+footer.TextXAlignment = Enum.TextXAlignment.Left
+footer.Parent = main
+
+--------------------------------------------------
+-- DRAGGABLE BUTTON HELPER
+--------------------------------------------------
+-- A single helper used by every floating side button.
+-- Clicking without moving fires onClick. Moving more
+-- than 6 px turns the gesture into a drag instead.
+--------------------------------------------------
+
+local function setupDraggableButton(button, onClick)
+	local dragging = false
+	local dragMoved = false
+	local dragStart = nil
+	local startPos = nil
+
+	button.InputBegan:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1
+			and input.UserInputType ~= Enum.UserInputType.Touch
+		then
+			return
+		end
+
+		dragging = true
+		dragMoved = false
+		dragStart = input.Position
+		startPos = button.Position
+
+		local conn
+		conn = input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				if dragging and not dragMoved then
+					onClick()
+				end
+				dragging = false
+				if conn then
+					conn:Disconnect()
+					conn = nil
+				end
+			end
+		end)
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if not dragging then return end
+
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement
+			and input.UserInputType ~= Enum.UserInputType.Touch
+		then
+			return
+		end
+
+		if not dragStart or not startPos then return end
+
+		local delta = input.Position - dragStart
+
+		if delta.Magnitude > 6 then
+			dragMoved = true
+		end
+
+		if dragMoved then
+			button.Position = UDim2.new(
+				startPos.X.Scale,
+				startPos.X.Offset + delta.X,
+				startPos.Y.Scale,
+				startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
+end
+
+--------------------------------------------------
+-- C TOGGLE BUTTON
+--------------------------------------------------
+
+local toggleBtn =
+	Instance.new("TextButton")
+
+toggleBtn.Name = "ToggleButton"
+toggleBtn.Size = UDim2.new(0, 68, 0, 68)
+toggleBtn.AnchorPoint = Vector2.new(0.5, 0.5)
+toggleBtn.Position = UDim2.new(1, -68, 0.28, 0)
+toggleBtn.BackgroundColor3 = C_PANEL
+toggleBtn.BorderSizePixel = 0
+toggleBtn.Text = "C"
+toggleBtn.TextColor3 = C_ACCENT
+toggleBtn.TextSize = 24
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.AutoButtonColor = false
+toggleBtn.Active = true
+toggleBtn.Parent = gui
+
+local toggleCorner = Instance.new("UICorner")
+toggleCorner.CornerRadius = UDim.new(1, 0)
+toggleCorner.Parent = toggleBtn
+
+local toggleStroke = Instance.new("UIStroke")
+toggleStroke.Thickness = 1.5
+toggleStroke.Color = C_BORDER_ON
+toggleStroke.Transparency = 0.05
+toggleStroke.Parent = toggleBtn
+
+toggleBtn.MouseEnter:Connect(function()
+	tween(toggleBtn, {
+		BackgroundColor3 = C_ROW_HOVER
+	}, 0.14):Play()
+	tween(toggleStroke, {
+		Color = C_ACCENT,
+		Transparency = 0
+	}, 0.14):Play()
+end)
+
+toggleBtn.MouseLeave:Connect(function()
+	tween(toggleBtn, {
+		BackgroundColor3 = C_PANEL
+	}, 0.14):Play()
+	tween(toggleStroke, {
+		Color = C_BORDER_ON,
+		Transparency = 0.05
+	}, 0.14):Play()
+end)
+
+--------------------------------------------------
+-- PANEL OPEN / CLOSE
+--------------------------------------------------
+
+local function openPanel()
+	if panelOpen then return end
+	panelOpen = true
+
+	main.Visible = true
+	panelScale.Scale = 0.85
+
+	tween(panelScale, {Scale = 1}, 0.28):Play()
+
+	tween(toggleBtn, {
+		BackgroundColor3 = C_ROW_ON,
+		TextColor3 = C_ACCENT
+	}, 0.18):Play()
+
+	toggleBtn.Text = "×"
+end
+
+local function closePanel()
+	if not panelOpen then return end
+	panelOpen = false
+
+	toggleBtn.Text = "C"
+
+	tween(toggleBtn, {
+		BackgroundColor3 = C_PANEL,
+		TextColor3 = C_ACCENT
+	}, 0.18):Play()
+
+	local t = tween(panelScale, {Scale = 0.85}, 0.22)
+
+	t:Play()
+
+	t.Completed:Connect(function()
+		if not panelOpen then
+			main.Visible = false
+			panelScale.Scale = 1
+		end
+	end)
+end
+
+local function togglePanel()
+	if panelOpen then
+		closePanel()
+	else
+		openPanel()
+	end
+end
+
+setupDraggableButton(toggleBtn, togglePanel)
+
+--------------------------------------------------
+-- KEYBIND UI REFRESH
+--------------------------------------------------
+
+local function refreshKeybindUI()
+	for name, row in pairs(keybindRows) do
+		local bind = keybinds[name]
+
+		if listeningForKey == name then
+			row.keyBtn.Text = "Press a key..."
+			row.keyBtn.TextColor3 = C_ACCENT
+			row.keyStroke.Color = C_BORDER_ON
+			row.keyStroke.Transparency = 0
+		elseif bind then
+			row.keyBtn.Text = bind.Name
+			row.keyBtn.TextColor3 = C_TEXT
+			row.keyStroke.Color = C_BORDER
+			row.keyStroke.Transparency = 0.15
+		else
+			row.keyBtn.Text = "None"
+			row.keyBtn.TextColor3 = C_MUTED
+			row.keyStroke.Color = C_BORDER
+			row.keyStroke.Transparency = 0.15
+		end
+	end
+end
+
+refreshKeybindUI()
+
+--------------------------------------------------
+-- TOGGLE HELPERS
+--------------------------------------------------
+
+local function doToggleAutoGrab()
+	autoGrabEnabled = not autoGrabEnabled
+
+	setButton(
+		autoGrabButton,
+		autoGrabEnabled,
+		autoGrabEnabled and "AUTO" or "OFF",
+		autoGrabEnabled and C_ACCENT or C_MUTED
+	)
+
+	if autoGrabEnabled then
+		startAutoGrab()
+		setStatus("Auto Grab  •  Active", true)
+	else
+		stopAutoGrab()
+
+		if hideEnabled then
+			setStatus("Hide Item  •  17 Speed", true)
+		elseif cframeEnabled then
+			setStatus(
+				"CFrame Speed  •  "
+				.. tostring(CFRAME_SPEED),
+				true
+			)
+		else
+			setStatus("CFrame: OFF", false)
+		end
+	end
+end
+
+local function doToggleCFrameSpeed()
+	cframeEnabled = not cframeEnabled
+
+	setButton(
+		cframeButton,
+		cframeEnabled,
+		cframeEnabled and "ON" or "OFF",
+		cframeEnabled and C_ACCENT or C_MUTED
+	)
+
+	if cframeEnabled then
+		setStatus(
+			"CFrame Speed  •  "
+			.. tostring(CFRAME_SPEED),
+			true
+		)
+	elseif hideEnabled then
+		setStatus("Hide Item  •  17 Speed", true)
+	else
+		setStatus("CFrame: OFF", false)
+	end
+
+	refreshCollision()
+end
+
+--------------------------------------------------
+-- KEYBIND INTERACTION
+--------------------------------------------------
+
+local function setupKeybindInteraction(name)
+	local row = keybindRows[name]
+
+	row.keyBtn.MouseButton1Click:Connect(function()
+		if listeningForKey == name then
+			listeningForKey = nil
+		else
+			listeningForKey = name
+		end
+		refreshKeybindUI()
+	end)
+
+	row.xBtn.MouseButton1Click:Connect(function()
+		local wasBound = keybinds[name] ~= nil
+		keybinds[name] = nil
+
+		if listeningForKey == name then
+			listeningForKey = nil
+		end
+
+		refreshKeybindUI()
+
+		if wasBound then
+			saveKeybinds()
+		end
+	end)
+end
+
+setupKeybindInteraction("autoGrab")
+setupKeybindInteraction("cframeSpeed")
+
+--------------------------------------------------
+-- KEYBOARD INPUT
+--------------------------------------------------
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then
+		return
+	end
+
+	if listeningForKey then
+		if input.KeyCode == Enum.KeyCode.Escape then
+			listeningForKey = nil
+			refreshKeybindUI()
+			return
+		end
+
+		keybinds[listeningForKey] = input.KeyCode
+		listeningForKey = nil
+		refreshKeybindUI()
+		saveKeybinds()
+		return
+	end
+
+	if gameProcessed then
+		return
+	end
+
+	if keybinds.autoGrab
+		and input.KeyCode == keybinds.autoGrab
+	then
+		doToggleAutoGrab()
+		return
+	end
+
+	if keybinds.cframeSpeed
+		and input.KeyCode == keybinds.cframeSpeed
+	then
+		doToggleCFrameSpeed()
+		return
+	end
+end)
+
+--------------------------------------------------
+-- SLIDER INPUT
+--------------------------------------------------
+
+UserInputService.InputChanged:Connect(function(input)
+	if input.UserInputType ~= Enum.UserInputType.MouseMovement
+		and input.UserInputType ~= Enum.UserInputType.Touch
+	then
+		return
+	end
+
+	for i = 1, #sliderRegistry do
+		local s = sliderRegistry[i]
+		if s.isDragging() then
+			s.update(input.Position.X)
+		end
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType ~= Enum.UserInputType.MouseButton1
+		and input.UserInputType ~= Enum.UserInputType.Touch
+	then
+		return
+	end
+
+	for i = 1, #sliderRegistry do
+		sliderRegistry[i].stop()
+	end
+end)
+
+--------------------------------------------------
+-- HIDE ITEM TOGGLE
+--------------------------------------------------
+
+hideButton.MouseButton1Click:Connect(function()
+	hideEnabled = not hideEnabled
+
+	hideVelocityY = 0
+
+	cachedFloorY = nil
+	floorTimer = 0
+
+	pendingFloorY = nil
+	pendingFloorCount = 0
+
+	local character = player.Character
+
+	local humanoid =
+		character
+		and character:FindFirstChildOfClass("Humanoid")
+
+	if hideEnabled then
+		if humanoid then
+			if savedAutoRotate == nil then
+				savedAutoRotate = humanoid.AutoRotate
+			end
+			humanoid.AutoRotate = false
+		end
+
+		setButton(
+			hideButton,
+			true,
+			"AUTO FLOOR",
+			C_ACCENT
+		)
+
+		setStatus("Hide Item  •  17 Speed", true)
+
+		refreshCollision()
+
+		if humanoid then
+			updateHideCamera(humanoid)
+		end
+	else
+		setButton(hideButton, false, "OFF", C_MUTED)
+
+		if humanoid then
+			humanoid.CameraOffset = Vector3.zero
+			humanoid.AutoRotate =
+				savedAutoRotate == nil
+				and true
+				or savedAutoRotate
+		end
+
+		savedAutoRotate = nil
+
+		refreshCollision()
+
+		local root =
+			character
+			and character:FindFirstChild("HumanoidRootPart")
+
+		if root then
+			local direction = flatLook(root)
+
+			root.CFrame =
+				CFrame.lookAt(
+					root.Position,
+					root.Position + direction
+				)
+		end
+
+		setStatus(
+			cframeEnabled
+				and ("CFrame Speed  •  " .. tostring(CFRAME_SPEED))
+				or "CFrame: OFF",
+			cframeEnabled
+		)
+	end
+end)
+
+--------------------------------------------------
+-- CFRAME SPEED BUTTON
+--------------------------------------------------
+
+cframeButton.MouseButton1Click:Connect(
+	doToggleCFrameSpeed
+)
+
+--------------------------------------------------
+-- FORWARD
+--------------------------------------------------
+
+forwardButton.MouseButton1Click:Connect(function()
+	if forwardActive then return end
+
+	forwardActive = true
+	forwardEnd = os.clock() + FORWARD_DURATION
+
+	setButton(forwardButton, true, "ACTIVE", C_ACCENT)
+	setStatus("Forward  •  40 Speed", true)
+
+	refreshCollision()
+end)
+
+--------------------------------------------------
+-- AUTO GRAB BUTTON
+--------------------------------------------------
+
+autoGrabButton.MouseButton1Click:Connect(
+	doToggleAutoGrab
+)
+
+--------------------------------------------------
+-- ESP
+--------------------------------------------------
+
+local espFolder = Instance.new("Folder")
+espFolder.Name = "ESPFolder"
+espFolder.Parent = gui
+
+local espBoxes = {}
+
+local ESP_PARTS = {
+	Head = true, Torso = true,
+	UpperTorso = true, LowerTorso = true,
+	["Left Arm"] = true, ["Right Arm"] = true,
+	["Left Leg"] = true, ["Right Leg"] = true,
+	LeftUpperArm = true, LeftLowerArm = true, LeftHand = true,
+	RightUpperArm = true, RightLowerArm = true, RightHand = true,
+	LeftUpperLeg = true, LeftLowerLeg = true, LeftFoot = true,
+	RightUpperLeg = true, RightLowerLeg = true, RightFoot = true,
+	HumanoidRootPart = true,
+}
+
+local function clearESP()
+	for _, child in ipairs(espFolder:GetChildren()) do
+		child:Destroy()
+	end
+
+	table.clear(espBoxes)
+	table.clear(espPartCache)
+end
+
+local function getESPParts(target)
+	local character = target.Character
+	if not character then return nil end
+
+	local entry = espPartCache[target]
+	if entry and entry.character == character then
+		return entry.parts
+	end
+
+	local parts = {}
+	local descendants = character:GetDescendants()
+
+	for i = 1, #descendants do
+		local part = descendants[i]
+
+		if part:IsA("BasePart")
+			and ESP_PARTS[part.Name]
+		then
+			parts[#parts + 1] = part
+		end
+	end
+
+	espPartCache[target] = {
+		character = character,
+		parts = parts,
+	}
+
+	return parts
+end
+
+local function createESP(target)
+	if target == player then return nil end
+
+	local holder = Instance.new("Frame")
+	holder.Name = target.Name
+	holder.BackgroundTransparency = 1
+	holder.BorderSizePixel = 0
+	holder.Visible = false
+	holder.Parent = espFolder
+
+	local box = Instance.new("Frame")
+	box.Size = UDim2.fromScale(1, 1)
+	box.BackgroundTransparency = 1
+	box.BorderSizePixel = 0
+	box.Parent = holder
+
+	local boxStroke = Instance.new("UIStroke")
+	boxStroke.Thickness = 1.5
+	boxStroke.Color = Color3.fromRGB(0, 255, 160)
+	boxStroke.Parent = box
+
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.Size = UDim2.new(1, 80, 0, 16)
+	nameLabel.Position = UDim2.new(0.5, 0, 0, -2)
+	nameLabel.AnchorPoint = Vector2.new(0.5, 1)
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Text = target.Name
+	nameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	nameLabel.TextStrokeTransparency = 0
+	nameLabel.TextSize = 13
+	nameLabel.Font = Enum.Font.GothamBold
+	nameLabel.Parent = holder
+
+	return holder
+end
+
+local function updateESP()
+	if not espEnabled then return end
+
+	local camera = workspace.CurrentCamera
+	if not camera then return end
+
+	local updated = {}
+	local players = Players:GetPlayers()
+
+	for i = 1, #players do
+		local target = players[i]
+
+		if target ~= player and target.Character then
+			local character = target.Character
+
+			local root =
+				character:FindFirstChild("HumanoidRootPart")
+
+			local humanoid =
+				character:FindFirstChildOfClass("Humanoid")
+
+			if root and humanoid and humanoid.Health > 0 then
+				updated[target] = true
+
+				if not espBoxes[target]
+					or not espBoxes[target].Parent
+				then
+					espBoxes[target] = createESP(target)
+				end
+
+				local holder = espBoxes[target]
+
+				local rootScreen =
+					camera:WorldToViewportPoint(root.Position)
+
+				if holder and rootScreen.Z > 0 then
+					local parts = getESPParts(target)
+
+					if parts and #parts > 0 then
+						local minX = math.huge
+						local maxX = -math.huge
+						local minY = math.huge
+						local maxY = -math.huge
+						local found = false
+
+						for pi = 1, #parts do
+							local part = parts[pi]
+
+							if part.Parent then
+								local half = part.Size * 0.5
+								local cf = part.CFrame
+
+								local hx, hy, hz =
+									half.X, half.Y, half.Z
+
+								local points = {
+									Vector3.new(-hx, -hy, -hz),
+									Vector3.new(-hx, -hy, hz),
+									Vector3.new(-hx, hy, -hz),
+									Vector3.new(-hx, hy, hz),
+									Vector3.new(hx, -hy, -hz),
+									Vector3.new(hx, -hy, hz),
+									Vector3.new(hx, hy, -hz),
+									Vector3.new(hx, hy, hz),
+								}
+
+								for ci = 1, 8 do
+									local screen =
+										camera:WorldToViewportPoint(
+											cf * points[ci]
+										)
+
+									if screen.Z > 0 then
+										if screen.X < minX then minX = screen.X end
+										if screen.X > maxX then maxX = screen.X end
+										if screen.Y < minY then minY = screen.Y end
+										if screen.Y > maxY then maxY = screen.Y end
+										found = true
+									end
+								end
+							end
+						end
+
+						if found then
+							holder.Size = UDim2.fromOffset(
+								math.clamp(maxX - minX, 8, 400),
+								math.clamp(maxY - minY, 12, 500)
+							)
+							holder.Position = UDim2.fromOffset(minX, minY)
+							holder.Visible = true
+						else
+							holder.Visible = false
+						end
+					else
+						holder.Visible = false
+					end
+				elseif holder then
+					holder.Visible = false
+				end
+			end
+		end
+	end
+
+	for target, holder in pairs(espBoxes) do
+		if not updated[target] then
+			holder:Destroy()
+			espBoxes[target] = nil
+			espPartCache[target] = nil
+		end
+	end
+end
+
+espButton.MouseButton1Click:Connect(function()
+	espEnabled = not espEnabled
+
+	setButton(
+		espButton,
+		espEnabled,
+		espEnabled and "ON" or "OFF",
+		espEnabled and C_ACCENT or C_MUTED
+	)
+
+	if not espEnabled then
+		clearESP()
+	end
+end)
+
+--------------------------------------------------
+-- SERVER HOP
+--------------------------------------------------
+
+local function getServers(placeId)
+	local url = string.format(
+		"https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100",
+		placeId
+	)
+
+	local ok, response = pcall(function()
+		return HttpService:JSONDecode(game:HttpGet(url))
+	end)
+
+	if not ok or not response or not response.data then
+		return nil
+	end
+
+	return response.data
+end
+
+local function resetHop(chip)
+	setButton(hopButton, false, chip or "⇄", C_MUTED)
+
+	task.delay(1.2, function()
+		hopping = false
+		setButton(hopButton, false, "⇄", C_MUTED)
+	end)
+end
+
+local reexecQueued = false
+
+local function queueReexecute()
+	if not AUTO_REEXEC or reexecQueued then
+		return
+	end
+
+	local queue =
+		queue_on_teleport
+		or (syn and syn.queue_on_teleport)
+		or (fluxus and fluxus.queue_on_teleport)
+
+	if type(queue) ~= "function" then
+		return
+	end
+
+	local code = string.format([[
+		if not game:IsLoaded() then game.Loaded:Wait() end
+		task.wait(1)
+
+		local src = nil
+		local file = %q
+		local url = %q
+
+		if file ~= "" and type(isfile) == "function" and isfile(file) then
+			local ok, data = pcall(readfile, file)
+			if ok and data and data ~= "" then
+				src = data
+			end
+		end
+
+		if not src and url ~= "" then
+			local ok, data = pcall(function()
+				return game:HttpGet(url)
+			end)
+			if ok and data and data ~= "" then
+				src = data
+			end
+		end
+
+		if src then
+			local fn = loadstring(src)
+			if fn then
+				fn()
+			end
+		end
+	]], REEXEC_FILE, REEXEC_URL)
+
+	local ok = pcall(queue, code)
+
+	if ok then
+		reexecQueued = true
+	end
+end
+
+local function serverHop()
+	if hopping then return end
+
+	hopping = true
+
+	setButton(hopButton, true, "SEARCH", C_ACCENT)
+	setStatus("Finding server...", true)
+
+	local placeId = game.PlaceId
+	local current = game.JobId
+
+	pushRecent(current)
+
+	if current and current ~= "" then
+		visitedServers[current] = os.time()
+	end
+
+	pruneLog(visitedServers)
+
+	local servers = getServers(placeId)
+
+	if not servers then
+		setStatus("Server list unavailable", false)
+		resetHop("FAIL")
+		return
+	end
+
+	local candidates = {}
+
+	for _, server in ipairs(servers) do
+		local id = server.id
+
+		if type(id) == "string"
+			and id ~= ""
+			and id ~= current
+			and server.playing < server.maxPlayers
+			and not isRecent(id)
+		then
+			local stamp = visitedServers[id]
+
+			candidates[#candidates + 1] = {
+				server = server,
+				id = id,
+				stamp = stamp or 0,
+				visited = stamp ~= nil,
+			}
+		end
+	end
+
+	if #candidates == 0 then
+		for _, server in ipairs(servers) do
+			local id = server.id
+
+			if type(id) == "string"
+				and id ~= ""
+				and id ~= current
+				and server.playing < server.maxPlayers
+			then
+				local stamp = visitedServers[id]
+
+				candidates[#candidates + 1] = {
+					server = server,
+					id = id,
+					stamp = stamp or 0,
+					visited = stamp ~= nil,
+				}
+			end
+		end
+	end
+
+	if #candidates == 0 then
+		setStatus("No other servers found", false)
+		resetHop("EMPTY")
+		return
+	end
+
+	table.sort(candidates, function(a, b)
+		if a.visited ~= b.visited then
+			return not a.visited
+		end
+		return a.stamp < b.stamp
+	end)
+
+	local fresh = {}
+
+	for _, candidate in ipairs(candidates) do
+		if not candidate.visited then
+			fresh[#fresh + 1] = candidate
+		end
+	end
+
+	local selected
+
+	if #fresh > 0 then
+		selected = fresh[math.random(1, #fresh)].server
+	else
+		selected = candidates[1].server
+	end
+
+	markVisited(selected.id)
+	pushRecent(selected.id)
+
+	setButton(hopButton, true, "JOIN", C_ACCENT)
+
+	setStatus(
+		"Joining " .. selected.id:sub(1, 8) .. "...",
+		true
+	)
+
+	queueReexecute()
+
+	local teleported = pcall(function()
+		TeleportService:TeleportToPlaceInstance(
+			placeId,
+			selected.id,
+			player
+		)
+	end)
+
+	if not teleported then
+		visitedServers[selected.id] = nil
+		saveLog(visitedServers)
+
+		setStatus("Teleport error", false)
+		resetHop("FAIL")
+	end
+end
+
+hopButton.MouseButton1Click:Connect(serverHop)
+
+--------------------------------------------------
+-- SERVER HOP SHORTCUT BUTTON
+--------------------------------------------------
+-- Sits to the left of the C toggle button.
+-- Draggable, and clicking (without dragging) runs
+-- the same serverHop() the panel button uses.
+--------------------------------------------------
+
+local hopShortcut =
+	Instance.new("TextButton")
+
+hopShortcut.Name = "ServerHopShortcut"
+hopShortcut.Size = UDim2.new(0, 132, 0, 68)
+hopShortcut.AnchorPoint = Vector2.new(1, 0.5)
+hopShortcut.Position = UDim2.new(1, -118, 0.28, 0)
+hopShortcut.BackgroundColor3 = C_PANEL
+hopShortcut.BorderSizePixel = 0
+hopShortcut.Text = "Server Hop"
+hopShortcut.TextColor3 = C_TEXT
+hopShortcut.TextSize = 13
+hopShortcut.Font = Enum.Font.GothamBold
+hopShortcut.AutoButtonColor = false
+hopShortcut.Active = true
+hopShortcut.Parent = gui
+
+local hopShortcutCorner =
+	Instance.new("UICorner")
+
+hopShortcutCorner.CornerRadius = UDim.new(1, 0)
+hopShortcutCorner.Parent = hopShortcut
+
+local hopShortcutStroke =
+	Instance.new("UIStroke")
+
+hopShortcutStroke.Thickness = 1.5
+hopShortcutStroke.Color = C_BORDER
+hopShortcutStroke.Transparency = 0.05
+hopShortcutStroke.Parent = hopShortcut
+
+hopShortcut.MouseEnter:Connect(function()
+	tween(hopShortcut, {
+		BackgroundColor3 = C_ROW_HOVER
+	}, 0.14):Play()
+	tween(hopShortcutStroke, {
+		Color = C_BORDER_HOVER,
+		Transparency = 0
+	}, 0.14):Play()
+end)
+
+hopShortcut.MouseLeave:Connect(function()
+	tween(hopShortcut, {
+		BackgroundColor3 = C_PANEL
+	}, 0.14):Play()
+	tween(hopShortcutStroke, {
+		Color = C_BORDER,
+		Transparency = 0.05
+	}, 0.14):Play()
+end)
+
+setupDraggableButton(hopShortcut, serverHop)
+
+--------------------------------------------------
+-- PANEL DRAG
+--------------------------------------------------
+
+local pDragging = false
+local pDragStart = nil
+local pStartPos = nil
+
+dragHandle.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch
+	then
+		pDragging = true
+		pDragStart = input.Position
+		pStartPos = main.Position
+
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				pDragging = false
+			end
+		end)
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if not pDragging then return end
+
+	if input.UserInputType ~= Enum.UserInputType.MouseMovement
+		and input.UserInputType ~= Enum.UserInputType.Touch
+	then
+		return
+	end
+
+	if not pDragStart or not pStartPos then
+		return
+	end
+
+	local delta = input.Position - pDragStart
+
+	main.Position = UDim2.new(
+		pStartPos.X.Scale,
+		pStartPos.X.Offset + delta.X,
+		pStartPos.Y.Scale,
+		pStartPos.Y.Offset + delta.Y
+	)
+end)
+
+--------------------------------------------------
+-- MOVEMENT LOOP
+--------------------------------------------------
+
+RunService.Heartbeat:Connect(function(dt)
+	updateESP()
+
+	local character = player.Character
+	if not character then return end
+
+	local humanoid =
+		character:FindFirstChildOfClass("Humanoid")
+
+	local root =
+		character:FindFirstChild("HumanoidRootPart")
+
+	if not humanoid or not root then
+		return
+	end
+
+	if hideEnabled then
+		humanoid.AutoRotate = false
+	end
+
+	--------------------------------------------------
+	-- AUTO GRAB
+	--------------------------------------------------
+
+	if autoGrabEnabled then
+		updateAutoGrab(root, dt)
+	end
+
+	--------------------------------------------------
+	-- FORWARD
+	--------------------------------------------------
+
+	if forwardActive then
+		if os.clock() >= forwardEnd then
+			forwardActive = false
+
+			setButton(forwardButton, false, "READY", C_MUTED)
+
+			if hideEnabled then
+				setStatus("Hide Item  •  17 Speed", true)
+			elseif cframeEnabled then
+				setStatus(
+					"CFrame Speed  •  "
+					.. tostring(CFRAME_SPEED),
+					true
+				)
+			else
+				setStatus("CFrame: OFF", false)
+			end
+
+			refreshCollision()
+		else
+			local direction = flatLook(root)
+
+			root.CFrame =
+				root.CFrame
+				+ direction * FORWARD_SPEED * dt
+		end
+
+	--------------------------------------------------
+	-- WALK
+	--------------------------------------------------
+
+	else
+		local movement = humanoid.MoveDirection
+
+		if movement.Magnitude > 0.05 then
+			local direction =
+				Vector3.new(
+					movement.X,
+					0,
+					movement.Z
+				)
+
+			if direction.Magnitude > 0.01 then
+				direction = direction.Unit
+
+				if cframeEnabled then
+					root.CFrame =
+						root.CFrame
+						+ direction * CFRAME_SPEED * dt
+
+				elseif hideEnabled then
+					root.CFrame =
+						root.CFrame
+						+ direction * HIDE_ITEM_SPEED * dt
+				end
+			end
+		end
+	end
+
+	--------------------------------------------------
+	-- VERTICAL OWNERSHIP
+	--------------------------------------------------
+
+	if hideEnabled then
+		applyHideRotation(root)
+
+		applyHidePlacement(
+			character,
+			root,
+			humanoid,
+			dt
+		)
+
+	elseif cframeEnabled then
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
+end)
+
+--------------------------------------------------
+-- INITIAL
+--------------------------------------------------
+
+setStatus("CFrame: OFF", false)
+
+-- Panel starts minimized. The C and Server Hop
+-- shortcut buttons are visible on the right edge.
